@@ -192,21 +192,33 @@ async function main() {
     });
   }
 
-  let userContent = prompt;
-  if (prompt.startsWith("/")) {
-    const parts = prompt.slice(1).trim().split(/\s+/);
-    const requestedSkill = parts[0];
-    const args = parts.slice(1);
+  const tokens = prompt.trim().split(/\s+/);
+  const bodies = [];
+  let index = 0;
+
+  while (index < tokens.length && tokens[index].startsWith("/")) {
+    const requestedSkill = tokens[index].slice(1);
     const skill = skills.find(
       (candidate) =>
         candidate.name === requestedSkill ||
         candidate.folderName === requestedSkill,
     );
-    if (skill) {
-      userContent = substituteArguments(await readSkillBody(skill), args);
+    if (!skill) {
+      break;
     }
+
+    bodies.push(await readSkillBody(skill));
+    index++;
   }
-  messages.push({ role: "user", content: userContent });
+
+  if (bodies.length > 0) {
+    const args = tokens.slice(index);
+    for (const body of bodies) {
+      messages.push({ role: "user", content: substituteArguments(body, args) });
+    }
+  } else {
+    messages.push({ role: "user", content: prompt });
+  }
 
   while (true) {
     const response = await client.chat.completions.create({
