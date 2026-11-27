@@ -1,6 +1,10 @@
+import { exec } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { promisify } from "node:util";
 import OpenAI from "openai";
+
+const execAsync = promisify(exec);
 
 async function main() {
   const [, , flag, prompt] = process.argv;
@@ -65,6 +69,23 @@ async function main() {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "Bash",
+        description: "Execute a shell command",
+        parameters: {
+          type: "object",
+          required: ["command"],
+          properties: {
+            command: {
+              type: "string",
+              description: "The command to execute",
+            },
+          },
+        },
+      },
+    },
   ];
 
   const messages = [{ role: "user", content: prompt }];
@@ -100,6 +121,19 @@ async function main() {
           await mkdir(dirname(args.file_path), { recursive: true });
           await writeFile(args.file_path, args.content, "utf8");
           result = `Successfully wrote to ${args.file_path}`;
+          break;
+        case "Bash":
+          try {
+            const { stdout, stderr } = await execAsync(args.command, {
+              cwd: process.cwd(),
+            });
+            result = [stdout, stderr].filter(Boolean).join("\n");
+          } catch (error) {
+            const output = [error.stdout, error.stderr]
+              .filter(Boolean)
+              .join("\n");
+            result = `Command failed: ${args.command}\n${output || error.message}`;
+          }
           break;
         default:
           throw new Error(`unsupported tool: ${toolCall.function.name}`);
