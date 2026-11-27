@@ -1,6 +1,7 @@
 import { exec } from "node:child_process";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import OpenAI from "openai";
 import { LSPClient } from "./lsp_client.js";
@@ -107,12 +108,55 @@ class Agent {
     this.tools = tools;
     this.skills = skills;
     this.lspClient = lspClient;
+    this.openedUris = new Set();
   }
 
   findSkill(name) {
     return this.skills.find(
       (candidate) => candidate.name === name || candidate.folderName === name,
     );
+  }
+
+  async ensureDocumentOpen(uri) {
+    if (this.openedUris.has(uri)) {
+      return;
+    }
+
+    const filePath = fileURLToPath(uri);
+    const text = await readFile(filePath, "utf8");
+    const languageId =
+      this.lspClient.extensionToLanguage?.[extname(filePath)] ?? "plaintext";
+
+    await this.lspClient.notify("textDocument/didOpen", {
+      textDocument: {
+        uri,
+        languageId,
+        version: 1,
+        text,
+      },
+    });
+
+    this.openedUris.add(uri);
+  }
+
+  async goToDefinition(args) {
+    const filePath = resolve(process.cwd(), args.filePath);
+    const uri = pathToFileURL(filePath).href;
+    await this.ensureDocumentOpen(uri);
+
+    const definition = await this.lspClient.request("textDocument/definition", {
+      textDocument: { uri },
+      position: {
+        line: args.line - 1,
+        character: args.character - 1,
+      },
+    });
+
+    const definedPath = relative(process.cwd(), fileURLToPath(definition.uri))
+      .split(sep)
+      .join("/");
+    const { line, character } = definition.range.start;
+    return `Defined in ${definedPath}:${line + 1}:${character + 1}`;
   }
 
   async executeTool(name, args) {
@@ -155,7 +199,13 @@ class Agent {
         return `Skill ${skill.name} ran in a separate context and returned: ${answer}`;
       }
       case "LSP":
-        return "LSP is not implemented yet";
+        if (!this.lspClient) {
+          return "LSP client is not configured";
+        }
+        if (args.operation === "goToDefinition") {
+          return await this.goToDefinition(args);
+        }
+        return `Unsupported LSP operation: ${args.operation}`;
       default:
         throw new Error(`unsupported tool: ${name}`);
     }
