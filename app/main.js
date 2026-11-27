@@ -117,6 +117,19 @@ class Agent {
     );
   }
 
+  lspDocument(filePath) {
+    const absolutePath = resolve(process.cwd(), filePath);
+    return { absolutePath, uri: pathToFileURL(absolutePath).href };
+  }
+
+  lspPosition(args) {
+    return { line: args.line - 1, character: args.character - 1 };
+  }
+
+  relativePath(uri) {
+    return relative(process.cwd(), fileURLToPath(uri)).split(sep).join("/");
+  }
+
   async ensureDocumentOpen(uri) {
     if (this.openedUris.has(uri)) {
       return;
@@ -140,23 +153,53 @@ class Agent {
   }
 
   async goToDefinition(args) {
-    const filePath = resolve(process.cwd(), args.filePath);
-    const uri = pathToFileURL(filePath).href;
+    const { uri } = this.lspDocument(args.filePath);
     await this.ensureDocumentOpen(uri);
 
     const definition = await this.lspClient.request("textDocument/definition", {
       textDocument: { uri },
-      position: {
-        line: args.line - 1,
-        character: args.character - 1,
-      },
+      position: this.lspPosition(args),
     });
 
-    const definedPath = relative(process.cwd(), fileURLToPath(definition.uri))
-      .split(sep)
-      .join("/");
+    const definedPath = this.relativePath(definition.uri);
     const { line, character } = definition.range.start;
     return `Defined in ${definedPath}:${line + 1}:${character + 1}`;
+  }
+
+  async findReferences(args) {
+    const { uri } = this.lspDocument(args.filePath);
+    await this.ensureDocumentOpen(uri);
+
+    const locations = await this.lspClient.request("textDocument/references", {
+      textDocument: { uri },
+      position: this.lspPosition(args),
+      context: { includeDeclaration: true },
+    });
+
+    if (!locations || locations.length === 0) {
+      return "No references found.";
+    }
+
+    const byFile = new Map();
+    for (const location of locations) {
+      const path = this.relativePath(location.uri);
+      const { line, character } = location.range.start;
+      if (!byFile.has(path)) {
+        byFile.set(path, []);
+      }
+      byFile.get(path).push(`  Line ${line + 1}:${character + 1}`);
+    }
+
+    const fileCount = byFile.size;
+    const lines = [
+      `Found ${locations.length} reference${locations.length === 1 ? "" : "s"} ` +
+        `across ${fileCount} file${fileCount === 1 ? "" : "s"}:`,
+      "",
+    ];
+    for (const [path, positions] of byFile) {
+      lines.push(`${path}:`, ...positions, "");
+    }
+    return lines.join("\n").trimEnd();
   }
 
   async executeTool(name, args) {
@@ -204,6 +247,9 @@ class Agent {
         }
         if (args.operation === "goToDefinition") {
           return await this.goToDefinition(args);
+        }
+        if (args.operation === "findReferences") {
+          return await this.findReferences(args);
         }
         return `Unsupported LSP operation: ${args.operation}`;
       default:
@@ -357,14 +403,19 @@ async function main() {
       function: {
         name: "LSP",
         description:
-          "Returns the file, line, and character where a symbol is defined. " +
-          "Line and character are 1-based, as in an editor.",
+          "Find a symbol's definition or all references to it. Use " +
+          "goToDefinition for the file, line, and character where the symbol " +
+          "is defined, and findReferences for every location that references " +
+          "the symbol. Line and character are 1-based, as in an editor.",
         parameters: {
           type: "object",
           properties: {
             operation: {
               type: "string",
-              enum: ["goToDefinition"],
+              enum: ["goToDefinition", "findReferences"],
+              description:
+                "goToDefinition finds where the symbol is defined; " +
+                "findReferences finds all uses of the symbol.",
             },
             filePath: {
               type: "string",
