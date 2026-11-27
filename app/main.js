@@ -1,10 +1,85 @@
 import { exec } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import OpenAI from "openai";
 
 const execAsync = promisify(exec);
+
+function frontmatterValue(value) {
+  return value.replace(/^["']|["']$/g, "");
+}
+
+async function parseSkillMetadata(filePath, folderName) {
+  const lines = (await readFile(filePath, "utf8")).split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") {
+    return null;
+  }
+
+  const skill = {
+    filePath,
+    folderName,
+    name: folderName,
+    description: "",
+    bodyStartLine: 0,
+  };
+
+  let index = 1;
+  for (; index < lines.length && lines[index].trim() !== "---"; index++) {
+    const match = lines[index].match(/^([^:]+):\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+
+    const key = match[1].trim();
+    const value = frontmatterValue(match[2].trim());
+    if (key === "name") {
+      skill.name = value;
+    } else if (key === "description") {
+      skill.description = value;
+    }
+  }
+
+  skill.bodyStartLine = index + 1;
+  return skill;
+}
+
+async function loadSkills() {
+  const skillsDir = join(process.cwd(), ".claude", "skills");
+
+  let entries;
+  try {
+    entries = await readdir(skillsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const skills = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+      continue;
+    }
+
+    try {
+      const skill = await parseSkillMetadata(
+        join(skillsDir, entry.name, "SKILL.md"),
+        entry.name,
+      );
+      if (skill) {
+        skills.push(skill);
+      }
+    } catch {
+      // Ignore directories without a readable SKILL.md.
+    }
+  }
+
+  return skills;
+}
+
+async function readSkillBody(skill) {
+  const lines = (await readFile(skill.filePath, "utf8")).split(/\r?\n/);
+  return lines.slice(skill.bodyStartLine).join("\n").trim();
+}
 
 async function main() {
   const [, , flag, prompt] = process.argv;
@@ -88,7 +163,33 @@ async function main() {
     },
   ];
 
-  const messages = [{ role: "user", content: prompt }];
+  const skills = await loadSkills();
+  const messages = [];
+
+  if (skills.length > 0) {
+    messages.push({
+      role: "system",
+      content:
+        "You have access to the following skills:\n\n" +
+        skills
+          .map((skill) => `- ${skill.name}: ${skill.description}`)
+          .join("\n"),
+    });
+  }
+
+  let userContent = prompt;
+  if (prompt.startsWith("/")) {
+    const requestedSkill = prompt.slice(1).split(/\s+/)[0];
+    const skill = skills.find(
+      (candidate) =>
+        candidate.name === requestedSkill ||
+        candidate.folderName === requestedSkill,
+    );
+    if (skill) {
+      userContent = await readSkillBody(skill);
+    }
+  }
+  messages.push({ role: "user", content: userContent });
 
   while (true) {
     const response = await client.chat.completions.create({
