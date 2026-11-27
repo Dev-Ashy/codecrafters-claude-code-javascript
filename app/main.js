@@ -308,7 +308,7 @@ class Agent {
     return lines.join("\n");
   }
 
-  deliverDiagnostics(messages, writeToolCallIds, afterIndex) {
+  deliverDiagnostics(messages) {
     if (!this.lspClient) {
       return;
     }
@@ -317,13 +317,9 @@ class Agent {
 
     let target = null;
     if (fresh.size > 0) {
-      for (let index = messages.length - 1; index > afterIndex; index--) {
-        const message = messages[index];
-        if (
-          message.role === "tool" &&
-          !writeToolCallIds.has(message.tool_call_id)
-        ) {
-          target = message;
+      for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index].role === "tool") {
+          target = messages[index];
           break;
         }
       }
@@ -444,12 +440,9 @@ class Agent {
   }
 
   async run(messages) {
-    const writeToolCallIds = new Set();
-    let lastWriteToolIndex = -1;
-
     while (true) {
       await this.refreshDiagnostics();
-      this.deliverDiagnostics(messages, writeToolCallIds, lastWriteToolIndex);
+      this.deliverDiagnostics(messages);
 
       const response = await this.client.chat.completions.create({
         model: this.model,
@@ -477,14 +470,10 @@ class Agent {
           tool_call_id: toolCall.id,
           content: result,
         });
-        if (name === "Write") {
-          writeToolCallIds.add(toolCall.id);
-          lastWriteToolIndex = messages.length - 1;
-        }
       }
 
       await this.refreshDiagnostics();
-      this.deliverDiagnostics(messages, writeToolCallIds, lastWriteToolIndex);
+      this.deliverDiagnostics(messages);
     }
   }
 }
