@@ -81,6 +81,21 @@ async function readSkillBody(skill) {
   return lines.slice(skill.bodyStartLine).join("\n").trim();
 }
 
+function substituteArguments(body, args) {
+  return body.replace(
+    /\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS|\$(\d+)/g,
+    (_match, indexed, shorthand) => {
+      if (indexed !== undefined) {
+        return args[Number(indexed)] ?? "";
+      }
+      if (shorthand !== undefined) {
+        return args[Number(shorthand)] ?? "";
+      }
+      return args.join(" ");
+    },
+  );
+}
+
 async function main() {
   const [, , flag, prompt] = process.argv;
   // CodeCrafters sets OPENROUTER_API_KEY and OPENROUTER_BASE_URL when it runs your tests.
@@ -179,14 +194,16 @@ async function main() {
 
   let userContent = prompt;
   if (prompt.startsWith("/")) {
-    const requestedSkill = prompt.slice(1).split(/\s+/)[0];
+    const parts = prompt.slice(1).trim().split(/\s+/);
+    const requestedSkill = parts[0];
+    const args = parts.slice(1);
     const skill = skills.find(
       (candidate) =>
         candidate.name === requestedSkill ||
         candidate.folderName === requestedSkill,
     );
     if (skill) {
-      userContent = await readSkillBody(skill);
+      userContent = substituteArguments(await readSkillBody(skill), args);
     }
   }
   messages.push({ role: "user", content: userContent });
