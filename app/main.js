@@ -108,7 +108,7 @@ class Agent {
     this.tools = tools;
     this.skills = skills;
     this.lspClient = lspClient;
-    this.openedUris = new Set();
+    this.documentVersions = new Map();
   }
 
   findSkill(name) {
@@ -130,26 +130,64 @@ class Agent {
     return relative(process.cwd(), fileURLToPath(uri)).split(sep).join("/");
   }
 
+  documentLanguageId(absolutePath) {
+    return (
+      this.lspClient.extensionToLanguage?.[extname(absolutePath)] ??
+      "plaintext"
+    );
+  }
+
   async ensureDocumentOpen(uri) {
-    if (this.openedUris.has(uri)) {
+    if (this.documentVersions.has(uri)) {
       return;
     }
 
     const filePath = fileURLToPath(uri);
     const text = await readFile(filePath, "utf8");
-    const languageId =
-      this.lspClient.extensionToLanguage?.[extname(filePath)] ?? "plaintext";
 
     await this.lspClient.notify("textDocument/didOpen", {
       textDocument: {
         uri,
-        languageId,
+        languageId: this.documentLanguageId(filePath),
         version: 1,
         text,
       },
     });
 
-    this.openedUris.add(uri);
+    this.documentVersions.set(uri, 1);
+  }
+
+  async synchronizeWrite(filePath, text) {
+    if (!this.lspClient) {
+      return;
+    }
+
+    const { absolutePath, uri } = this.lspDocument(filePath);
+    const extension = extname(absolutePath);
+    if (this.lspClient.extensionToLanguage?.[extension] === undefined) {
+      return;
+    }
+
+    const currentVersion = this.documentVersions.get(uri);
+    if (currentVersion === undefined) {
+      await this.lspClient.notify("textDocument/didOpen", {
+        textDocument: {
+          uri,
+          languageId: this.documentLanguageId(absolutePath),
+          version: 1,
+          text,
+        },
+      });
+      this.documentVersions.set(uri, 1);
+      return;
+    }
+
+    const nextVersion = currentVersion + 1;
+    await this.lspClient.notify("textDocument/didChange", {
+      textDocument: { uri, version: nextVersion },
+      contentChanges: [{ text }],
+    });
+    this.documentVersions.set(uri, nextVersion);
   }
 
   async goToDefinition(args) {
@@ -209,6 +247,7 @@ class Agent {
       case "Write":
         await mkdir(dirname(args.file_path), { recursive: true });
         await writeFile(args.file_path, args.content, "utf8");
+        await this.synchronizeWrite(args.file_path, args.content);
         return `Successfully wrote to ${args.file_path}`;
       case "Bash":
         try {
