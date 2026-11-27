@@ -25,51 +25,61 @@ async function main() {
     baseURL: baseURL,
   });
 
-  const response = await client.chat.completions.create({
-    model: model,
-    messages: [{ role: "user", content: prompt }],
-    tools: [
-      {
-        type: "function",
-        function: {
-          name: "Read",
-          description: "Read and return the contents of a file",
-          parameters: {
-            type: "object",
-            properties: {
-              file_path: {
-                type: "string",
-                description: "The path to the file to read",
-              },
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "Read",
+        description: "Read and return the contents of a file",
+        parameters: {
+          type: "object",
+          properties: {
+            file_path: {
+              type: "string",
+              description: "The path to the file to read",
             },
-            required: ["file_path"],
           },
+          required: ["file_path"],
         },
       },
-    ],
-  });
+    },
+  ];
 
-  if (!response.choices || response.choices.length === 0) {
-    throw new Error("no choices in response");
-  }
+  const messages = [{ role: "user", content: prompt }];
 
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
-  console.error("Logs from your program will appear here!");
+  while (true) {
+    const response = await client.chat.completions.create({
+      model: model,
+      messages: messages,
+      tools: tools,
+    });
 
-  const message = response.choices[0].message;
-
-  if (message.tool_calls?.length) {
-    const toolCall = message.tool_calls[0];
-    const args = JSON.parse(toolCall.function.arguments);
-
-    if (toolCall.function.name !== "Read") {
-      throw new Error(`unsupported tool: ${toolCall.function.name}`);
+    if (!response.choices || response.choices.length === 0) {
+      throw new Error("no choices in response");
     }
 
-    const content = await readFile(args.file_path, "utf8");
-    process.stdout.write(content);
-  } else {
-    console.log(message.content);
+    const message = response.choices[0].message;
+    messages.push(message);
+
+    if (!message.tool_calls?.length) {
+      console.log(message.content);
+      break;
+    }
+
+    for (const toolCall of message.tool_calls) {
+      if (toolCall.function.name !== "Read") {
+        throw new Error(`unsupported tool: ${toolCall.function.name}`);
+      }
+
+      const args = JSON.parse(toolCall.function.arguments);
+      const content = await readFile(args.file_path, "utf8");
+
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: content,
+      });
+    }
   }
 }
 
