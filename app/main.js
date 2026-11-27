@@ -211,7 +211,9 @@ async function main() {
           .map((skill) => `- ${skill.name}: ${skill.description}`)
           .join("\n") +
         "\n\nIf a skill matches the user's request, call the Skill tool with its name\n" +
-        "and follow the instructions it returns.",
+        "and follow the instructions it returns.\n\n" +
+        "When giving the final answer, follow the user's requested output format exactly. " +
+        "If the user asks for a number, respond with only that number and no explanation.",
     });
   }
 
