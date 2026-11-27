@@ -21,6 +21,7 @@ async function parseSkillMetadata(filePath, folderName) {
     folderName,
     name: folderName,
     description: "",
+    fork: false,
     bodyStartLine: 0,
   };
 
@@ -37,6 +38,8 @@ async function parseSkillMetadata(filePath, folderName) {
       skill.name = value;
     } else if (key === "description") {
       skill.description = value;
+    } else if (key === "context") {
+      skill.fork = value === "fork";
     }
   }
 
@@ -94,6 +97,96 @@ function substituteArguments(body, args) {
       return args.join(" ");
     },
   );
+}
+
+class Agent {
+  constructor(client, model, tools, skills) {
+    this.client = client;
+    this.model = model;
+    this.tools = tools;
+    this.skills = skills;
+  }
+
+  findSkill(name) {
+    return this.skills.find(
+      (candidate) => candidate.name === name || candidate.folderName === name,
+    );
+  }
+
+  async executeTool(name, args) {
+    switch (name) {
+      case "Read":
+        return await readFile(args.file_path, "utf8");
+      case "Write":
+        await mkdir(dirname(args.file_path), { recursive: true });
+        await writeFile(args.file_path, args.content, "utf8");
+        return `Successfully wrote to ${args.file_path}`;
+      case "Bash":
+        try {
+          const { stdout, stderr } = await execAsync(args.command, {
+            cwd: process.cwd(),
+          });
+          return [stdout, stderr].filter(Boolean).join("\n");
+        } catch (error) {
+          const output = [error.stdout, error.stderr].filter(Boolean).join("\n");
+          return `Command failed: ${args.command}\n${output || error.message}`;
+        }
+      case "Skill": {
+        const skill = this.findSkill(args.name);
+        if (!skill) {
+          return `Unknown skill: ${args.name}`;
+        }
+        const skillArgs =
+          typeof args.args === "string" && args.args.trim()
+            ? args.args.trim().split(/\s+/)
+            : [];
+        const body = substituteArguments(
+          await readSkillBody(skill),
+          skillArgs,
+        );
+
+        if (!skill.fork) {
+          return body;
+        }
+
+        const answer = await this.run([{ role: "user", content: body }]);
+        return `Skill ${skill.name} ran in a separate context and returned: ${answer}`;
+      }
+      default:
+        throw new Error(`unsupported tool: ${name}`);
+    }
+  }
+
+  async run(messages) {
+    while (true) {
+      const response = await this.client.chat.completions.create({
+        model: this.model,
+        messages: messages,
+        tools: this.tools,
+      });
+
+      if (!response.choices || response.choices.length === 0) {
+        throw new Error("no choices in response");
+      }
+
+      const message = response.choices[0].message;
+      messages.push(message);
+
+      if (!message.tool_calls?.length) {
+        return message.content ?? "";
+      }
+
+      for (const toolCall of message.tool_calls) {
+        const args = JSON.parse(toolCall.function.arguments);
+        const result = await this.executeTool(toolCall.function.name, args);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: result,
+        });
+      }
+    }
+  }
 }
 
 async function main() {
@@ -200,6 +293,7 @@ async function main() {
   ];
 
   const skills = await loadSkills();
+  const agent = new Agent(client, model, tools, skills);
   const messages = [];
 
   if (skills.length > 0) {
@@ -218,106 +312,43 @@ async function main() {
   }
 
   const tokens = prompt.trim().split(/\s+/);
-  const bodies = [];
+  const invokedSkills = [];
   let index = 0;
 
   while (index < tokens.length && tokens[index].startsWith("/")) {
     const requestedSkill = tokens[index].slice(1);
-    const skill = skills.find(
-      (candidate) =>
-        candidate.name === requestedSkill ||
-        candidate.folderName === requestedSkill,
-    );
+    const skill = agent.findSkill(requestedSkill);
     if (!skill) {
       break;
     }
 
-    bodies.push(await readSkillBody(skill));
+    invokedSkills.push(skill);
     index++;
+
+    if (skill.fork) {
+      break;
+    }
   }
 
-  if (bodies.length > 0) {
+  if (invokedSkills.length > 0) {
     const args = tokens.slice(index);
-    for (const body of bodies) {
-      messages.push({ role: "user", content: substituteArguments(body, args) });
+    for (const skill of invokedSkills) {
+      const body = substituteArguments(await readSkillBody(skill), args);
+      if (skill.fork) {
+        const answer = await agent.run([{ role: "user", content: body }]);
+        messages.push({
+          role: "user",
+          content: `Skill ${skill.name} ran in a separate context and returned: ${answer}`,
+        });
+      } else {
+        messages.push({ role: "user", content: body });
+      }
     }
   } else {
     messages.push({ role: "user", content: prompt });
   }
 
-  while (true) {
-    const response = await client.chat.completions.create({
-      model: model,
-      messages: messages,
-      tools: tools,
-    });
-
-    if (!response.choices || response.choices.length === 0) {
-      throw new Error("no choices in response");
-    }
-
-    const message = response.choices[0].message;
-    messages.push(message);
-
-    if (!message.tool_calls?.length) {
-      console.log(message.content);
-      break;
-    }
-
-    for (const toolCall of message.tool_calls) {
-      const args = JSON.parse(toolCall.function.arguments);
-      let result;
-
-      switch (toolCall.function.name) {
-        case "Read":
-          result = await readFile(args.file_path, "utf8");
-          break;
-        case "Write":
-          await mkdir(dirname(args.file_path), { recursive: true });
-          await writeFile(args.file_path, args.content, "utf8");
-          result = `Successfully wrote to ${args.file_path}`;
-          break;
-        case "Bash":
-          try {
-            const { stdout, stderr } = await execAsync(args.command, {
-              cwd: process.cwd(),
-            });
-            result = [stdout, stderr].filter(Boolean).join("\n");
-          } catch (error) {
-            const output = [error.stdout, error.stderr]
-              .filter(Boolean)
-              .join("\n");
-            result = `Command failed: ${args.command}\n${output || error.message}`;
-          }
-          break;
-        case "Skill":
-          {
-            const skill = skills.find(
-              (candidate) =>
-                candidate.name === args.name || candidate.folderName === args.name,
-            );
-            if (!skill) {
-              result = `Unknown skill: ${args.name}`;
-            } else {
-              const skillArgs =
-                typeof args.args === "string" && args.args.trim()
-                  ? args.args.trim().split(/\s+/)
-                  : [];
-              result = substituteArguments(await readSkillBody(skill), skillArgs);
-            }
-          }
-          break;
-        default:
-          throw new Error(`unsupported tool: ${toolCall.function.name}`);
-      }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: result,
-      });
-    }
-  }
+  console.log(await agent.run(messages));
 }
 
 main();
