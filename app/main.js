@@ -176,6 +176,27 @@ async function main() {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "Skill",
+        description: "Load a skill's instructions into the conversation",
+        parameters: {
+          type: "object",
+          required: ["name"],
+          properties: {
+            name: {
+              type: "string",
+              description: "The name of the skill to use",
+            },
+            args: {
+              type: "string",
+              description: "Optional arguments for the skill",
+            },
+          },
+        },
+      },
+    },
   ];
 
   const skills = await loadSkills();
@@ -188,7 +209,9 @@ async function main() {
         "You have access to the following skills:\n\n" +
         skills
           .map((skill) => `- ${skill.name}: ${skill.description}`)
-          .join("\n"),
+          .join("\n") +
+        "\n\nIf a skill matches the user's request, call the Skill tool with its name\n" +
+        "and follow the instructions it returns.",
     });
   }
 
@@ -263,6 +286,23 @@ async function main() {
               .filter(Boolean)
               .join("\n");
             result = `Command failed: ${args.command}\n${output || error.message}`;
+          }
+          break;
+        case "Skill":
+          {
+            const skill = skills.find(
+              (candidate) =>
+                candidate.name === args.name || candidate.folderName === args.name,
+            );
+            if (!skill) {
+              result = `Unknown skill: ${args.name}`;
+            } else {
+              const skillArgs =
+                typeof args.args === "string" && args.args.trim()
+                  ? args.args.trim().split(/\s+/)
+                  : [];
+              result = substituteArguments(await readSkillBody(skill), skillArgs);
+            }
           }
           break;
         default:
