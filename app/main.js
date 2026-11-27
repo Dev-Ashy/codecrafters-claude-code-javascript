@@ -109,6 +109,9 @@ class Agent {
     this.skills = skills;
     this.lspClient = lspClient;
     this.documentVersions = new Map();
+    this.diagnosticCursor = 0;
+    this.currentDiagnostics = new Map();
+    this.shownDiagnostics = new Map();
   }
 
   findSkill(name) {
@@ -188,6 +191,150 @@ class Agent {
       contentChanges: [{ text }],
     });
     this.documentVersions.set(uri, nextVersion);
+  }
+
+  async refreshDiagnostics() {
+    if (!this.lspClient) {
+      return;
+    }
+
+    let response;
+    try {
+      response = await this.lspClient.notifications(this.diagnosticCursor, 0);
+    } catch {
+      return;
+    }
+
+    if (response?.cursor !== undefined) {
+      this.diagnosticCursor = response.cursor;
+    }
+
+    for (const notification of response?.notifications ?? []) {
+      if (notification?.method !== "textDocument/publishDiagnostics") {
+        continue;
+      }
+
+      const params = notification.params ?? {};
+      const uri = params.uri;
+      if (!uri) {
+        continue;
+      }
+
+      const version = params.version;
+      if (version !== undefined && version !== null) {
+        if (this.documentVersions.get(uri) !== version) {
+          continue;
+        }
+      }
+
+      const items = Array.isArray(params.diagnostics) ? params.diagnostics : [];
+      const diagnostics = items.map((item) => {
+        const start = item?.range?.start ?? { line: 0, character: 0 };
+        const message = item?.message ?? "";
+        return {
+          path: this.diagnosticPath(uri),
+          line: start.line + 1,
+          character: start.character + 1,
+          message,
+          key: `${uri}\u0000${start.line}\u0000${start.character}\u0000${message}`,
+        };
+      });
+
+      this.currentDiagnostics.set(uri, diagnostics);
+    }
+  }
+
+  diagnosticPath(uri) {
+    try {
+      return this.relativePath(uri);
+    } catch {
+      return uri;
+    }
+  }
+
+  pendingDiagnostics() {
+    const fresh = new Map();
+    for (const [uri, diagnostics] of this.currentDiagnostics) {
+      const shown = this.shownDiagnostics.get(uri) ?? new Set();
+      const unseen = diagnostics.filter(
+        (diagnostic) => !shown.has(diagnostic.key),
+      );
+      if (unseen.length > 0) {
+        fresh.set(uri, unseen);
+      }
+    }
+    return fresh;
+  }
+
+  markDiagnosticsShown() {
+    for (const [uri, diagnostics] of this.currentDiagnostics) {
+      this.shownDiagnostics.set(
+        uri,
+        new Set(diagnostics.map((diagnostic) => diagnostic.key)),
+      );
+    }
+    for (const uri of this.shownDiagnostics.keys()) {
+      if (!this.currentDiagnostics.has(uri)) {
+        this.shownDiagnostics.delete(uri);
+      }
+    }
+  }
+
+  formatDiagnostics(groups) {
+    const byPath = new Map();
+    for (const diagnostics of groups.values()) {
+      for (const diagnostic of diagnostics) {
+        if (!byPath.has(diagnostic.path)) {
+          byPath.set(diagnostic.path, []);
+        }
+        byPath.get(diagnostic.path).push(diagnostic);
+      }
+    }
+
+    const lines = [
+      "<new-diagnostics>The following new diagnostic issues were detected:",
+      "",
+    ];
+    for (const [path, diagnostics] of byPath) {
+      lines.push(`${path}:`);
+      for (const diagnostic of diagnostics) {
+        lines.push(
+          `  [Line ${diagnostic.line}:${diagnostic.character}] ${diagnostic.message}`,
+        );
+      }
+      lines.push("");
+    }
+    lines.push("</new-diagnostics>");
+    return lines.join("\n");
+  }
+
+  deliverDiagnostics(messages, writeToolCallIds, afterIndex) {
+    if (!this.lspClient) {
+      return;
+    }
+
+    const fresh = this.pendingDiagnostics();
+
+    let target = null;
+    if (fresh.size > 0) {
+      for (let index = messages.length - 1; index > afterIndex; index--) {
+        const message = messages[index];
+        if (
+          message.role === "tool" &&
+          !writeToolCallIds.has(message.tool_call_id)
+        ) {
+          target = message;
+          break;
+        }
+      }
+      if (!target) {
+        return;
+      }
+      const text = this.formatDiagnostics(fresh);
+      target.content = `${target.content ?? ""}\n\n${text}`.trim();
+    }
+
+    this.markDiagnosticsShown();
   }
 
   async goToDefinition(args) {
@@ -297,7 +444,13 @@ class Agent {
   }
 
   async run(messages) {
+    const writeToolCallIds = new Set();
+    let lastWriteToolIndex = -1;
+
     while (true) {
+      await this.refreshDiagnostics();
+      this.deliverDiagnostics(messages, writeToolCallIds, lastWriteToolIndex);
+
       const response = await this.client.chat.completions.create({
         model: this.model,
         messages: messages,
@@ -316,14 +469,22 @@ class Agent {
       }
 
       for (const toolCall of message.tool_calls) {
+        const name = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments);
-        const result = await this.executeTool(toolCall.function.name, args);
+        const result = await this.executeTool(name, args);
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
           content: result,
         });
+        if (name === "Write") {
+          writeToolCallIds.add(toolCall.id);
+          lastWriteToolIndex = messages.length - 1;
+        }
       }
+
+      await this.refreshDiagnostics();
+      this.deliverDiagnostics(messages, writeToolCallIds, lastWriteToolIndex);
     }
   }
 }
