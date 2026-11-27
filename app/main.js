@@ -109,9 +109,12 @@ class Agent {
     this.skills = skills;
     this.lspClient = lspClient;
     this.documentVersions = new Map();
+    this.sentVersions = new Map();
     this.diagnosticCursor = 0;
     this.currentDiagnostics = new Map();
     this.shownDiagnostics = new Map();
+    this.pendingReports = new Map();
+    this.diagnosticReportState = new Map();
   }
 
   findSkill(name) {
@@ -140,6 +143,15 @@ class Agent {
     );
   }
 
+  recordSentVersion(uri, version) {
+    let versions = this.sentVersions.get(uri);
+    if (!versions) {
+      versions = new Set();
+      this.sentVersions.set(uri, versions);
+    }
+    versions.add(version);
+  }
+
   async ensureDocumentOpen(uri) {
     if (this.documentVersions.has(uri)) {
       return;
@@ -158,6 +170,7 @@ class Agent {
     });
 
     this.documentVersions.set(uri, 1);
+    this.recordSentVersion(uri, 1);
   }
 
   async synchronizeWrite(filePath, text) {
@@ -182,6 +195,7 @@ class Agent {
         },
       });
       this.documentVersions.set(uri, 1);
+      this.recordSentVersion(uri, 1);
       return;
     }
 
@@ -191,6 +205,38 @@ class Agent {
       contentChanges: [{ text }],
     });
     this.documentVersions.set(uri, nextVersion);
+    this.recordSentVersion(uri, nextVersion);
+  }
+
+  diagnosticReportStateFor(uri) {
+    let state = this.diagnosticReportState.get(uri);
+    if (!state) {
+      state = { sawUnversioned: false, maxVersion: null };
+      this.diagnosticReportState.set(uri, state);
+    }
+    return state;
+  }
+
+  isStaleDiagnosticReport(uri, version) {
+    if (version === undefined || version === null) {
+      return false;
+    }
+    const state = this.diagnosticReportStateFor(uri);
+    if (state.sawUnversioned) {
+      return true;
+    }
+    return state.maxVersion !== null && version < state.maxVersion;
+  }
+
+  recordDiagnosticReport(uri, version) {
+    const state = this.diagnosticReportStateFor(uri);
+    if (version === undefined || version === null) {
+      state.sawUnversioned = true;
+      return;
+    }
+    if (state.maxVersion === null || version > state.maxVersion) {
+      state.maxVersion = version;
+    }
   }
 
   async refreshDiagnostics() {
@@ -222,10 +268,15 @@ class Agent {
 
       const version = params.version;
       if (version !== undefined && version !== null) {
-        if (this.documentVersions.get(uri) !== version) {
+        const sent = this.sentVersions.get(uri);
+        if (!sent || !sent.has(version)) {
           continue;
         }
       }
+      if (this.isStaleDiagnosticReport(uri, version)) {
+        continue;
+      }
+      this.recordDiagnosticReport(uri, version);
 
       const items = Array.isArray(params.diagnostics) ? params.diagnostics : [];
       const diagnostics = items.map((item) => {
@@ -240,6 +291,21 @@ class Agent {
         };
       });
 
+      const keys = new Set(diagnostics.map((diagnostic) => diagnostic.key));
+      const shown = this.shownDiagnostics.get(uri) ?? new Set();
+      const pending = this.pendingReports.get(uri) ?? [];
+      const pendingKeys = new Set(pending.map((diagnostic) => diagnostic.key));
+      const fresh = diagnostics.filter(
+        (diagnostic) =>
+          !shown.has(diagnostic.key) && !pendingKeys.has(diagnostic.key),
+      );
+      if (fresh.length > 0) {
+        this.pendingReports.set(uri, [...pending, ...fresh]);
+      }
+      this.shownDiagnostics.set(
+        uri,
+        new Set([...shown].filter((key) => keys.has(key))),
+      );
       this.currentDiagnostics.set(uri, diagnostics);
     }
   }
@@ -249,34 +315,6 @@ class Agent {
       return this.relativePath(uri);
     } catch {
       return uri;
-    }
-  }
-
-  pendingDiagnostics() {
-    const fresh = new Map();
-    for (const [uri, diagnostics] of this.currentDiagnostics) {
-      const shown = this.shownDiagnostics.get(uri) ?? new Set();
-      const unseen = diagnostics.filter(
-        (diagnostic) => !shown.has(diagnostic.key),
-      );
-      if (unseen.length > 0) {
-        fresh.set(uri, unseen);
-      }
-    }
-    return fresh;
-  }
-
-  markDiagnosticsShown() {
-    for (const [uri, diagnostics] of this.currentDiagnostics) {
-      this.shownDiagnostics.set(
-        uri,
-        new Set(diagnostics.map((diagnostic) => diagnostic.key)),
-      );
-    }
-    for (const uri of this.shownDiagnostics.keys()) {
-      if (!this.currentDiagnostics.has(uri)) {
-        this.shownDiagnostics.delete(uri);
-      }
     }
   }
 
@@ -313,24 +351,39 @@ class Agent {
       return;
     }
 
-    const fresh = this.pendingDiagnostics();
-
-    let target = null;
-    if (fresh.size > 0) {
-      for (let index = messages.length - 1; index >= 0; index--) {
-        if (messages[index].role === "tool") {
-          target = messages[index];
-          break;
-        }
-      }
-      if (!target) {
-        return;
-      }
-      const text = this.formatDiagnostics(fresh);
-      target.content = `${target.content ?? ""}\n\n${text}`.trim();
+    const pending = new Map(
+      [...this.pendingReports].filter(([, diagnostics]) => diagnostics.length > 0),
+    );
+    if (pending.size === 0) {
+      return;
     }
 
-    this.markDiagnosticsShown();
+    let target = null;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index].role === "tool") {
+        target = messages[index];
+        break;
+      }
+    }
+    if (!target) {
+      return;
+    }
+
+    const text = this.formatDiagnostics(pending);
+    target.content = `${target.content ?? ""}\n\n${text}`.trim();
+
+    for (const [uri, diagnostics] of pending) {
+      const current = this.currentDiagnostics.get(uri) ?? [];
+      const currentKeys = new Set(current.map((diagnostic) => diagnostic.key));
+      const shown = this.shownDiagnostics.get(uri) ?? new Set();
+      for (const diagnostic of diagnostics) {
+        if (currentKeys.has(diagnostic.key)) {
+          shown.add(diagnostic.key);
+        }
+      }
+      this.shownDiagnostics.set(uri, shown);
+      this.pendingReports.delete(uri);
+    }
   }
 
   async goToDefinition(args) {
@@ -386,7 +439,11 @@ class Agent {
   async executeTool(name, args) {
     switch (name) {
       case "Read":
-        return await readFile(args.file_path, "utf8");
+        try {
+          return await readFile(args.file_path, "utf8");
+        } catch (error) {
+          return `Failed to read ${args.file_path}: ${error.message}`;
+        }
       case "Write":
         await mkdir(dirname(args.file_path), { recursive: true });
         await writeFile(args.file_path, args.content, "utf8");
@@ -464,7 +521,12 @@ class Agent {
       for (const toolCall of message.tool_calls) {
         const name = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments);
-        const result = await this.executeTool(name, args);
+        let result;
+        try {
+          result = await this.executeTool(name, args);
+        } catch (error) {
+          result = `Tool ${name} failed: ${error.message}`;
+        }
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
