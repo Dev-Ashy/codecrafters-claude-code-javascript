@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import OpenAI from "openai";
 
 async function main() {
@@ -43,6 +44,27 @@ async function main() {
         },
       },
     },
+    {
+      type: "function",
+      function: {
+        name: "Write",
+        description: "Write content to a file",
+        parameters: {
+          type: "object",
+          required: ["file_path", "content"],
+          properties: {
+            file_path: {
+              type: "string",
+              description: "The path of the file to write to",
+            },
+            content: {
+              type: "string",
+              description: "The content to write to the file",
+            },
+          },
+        },
+      },
+    },
   ];
 
   const messages = [{ role: "user", content: prompt }];
@@ -67,17 +89,26 @@ async function main() {
     }
 
     for (const toolCall of message.tool_calls) {
-      if (toolCall.function.name !== "Read") {
-        throw new Error(`unsupported tool: ${toolCall.function.name}`);
-      }
-
       const args = JSON.parse(toolCall.function.arguments);
-      const content = await readFile(args.file_path, "utf8");
+      let result;
+
+      switch (toolCall.function.name) {
+        case "Read":
+          result = await readFile(args.file_path, "utf8");
+          break;
+        case "Write":
+          await mkdir(dirname(args.file_path), { recursive: true });
+          await writeFile(args.file_path, args.content, "utf8");
+          result = `Successfully wrote to ${args.file_path}`;
+          break;
+        default:
+          throw new Error(`unsupported tool: ${toolCall.function.name}`);
+      }
 
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
-        content: content,
+        content: result,
       });
     }
   }
